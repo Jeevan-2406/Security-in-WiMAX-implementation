@@ -6,6 +6,11 @@ from tkinter import messagebox, Listbox, scrolledtext
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives import padding as symmetric_padding  # For AES padding
+import traceback  # Add this for better error tracking
+import os
+from base64 import b64encode, b64decode
 
 class WiMAXClient:
     def __init__(self, broadcast_port=54321):
@@ -80,13 +85,19 @@ class WiMAXClient:
 
             print("\nStep 3: Receiving encrypted challenge from server")
             encrypted_challenge = self.conn.recv(1024)
+            if not encrypted_challenge:
+                raise Exception("No challenge received from server")
             print(f"Received encrypted challenge: {encrypted_challenge.hex()}")
             print("-"*50)
 
             print("\nStep 4: Decrypting server's challenge")
             server_challenge = self.client_private_key.decrypt(
                 encrypted_challenge,
-                padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
             )
             print(f"Decrypted challenge: {server_challenge.decode()}")
             print("-"*50)
@@ -108,19 +119,82 @@ class WiMAXClient:
             if auth_result != "Authentication Successful":
                 print("Authentication failed. Closing connection.")
                 self.conn.close()
+            else:
+                # Receive and decrypt session key
+                encrypted_session_key = self.conn.recv(1024)
+                self.session_key = self.client_private_key.decrypt(
+                    encrypted_session_key,
+                    padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()), 
+                                algorithm=hashes.SHA256(), 
+                                label=None)
+                )
             return auth_result
         except Exception as e:
             print(f"\nError during authentication: {e}")
+            traceback.print_exc()  # Add this for detailed error tracking
             self.close_connection()
             return "Authentication Error"
 
+    def encrypt_message(self, message):
+        try:
+            # Convert the message to bytes if it's a string
+            if isinstance(message, str):
+                message = message.encode()
+            
+            # Add padding
+            padder = symmetric_padding.PKCS7(128).padder()
+            padded_data = padder.update(message) + padder.finalize()
+            
+            # Generate IV and encrypt
+            iv = os.urandom(16)
+            cipher = Cipher(algorithms.AES(self.session_key), modes.CBC(iv))
+            encryptor = cipher.encryptor()
+            encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+            
+            # Combine IV and encrypted data and encode to base64
+            combined_data = iv + encrypted_data
+            return b64encode(combined_data).decode('utf-8')
+        except Exception as e:
+            print(f"Encryption error: {e}")
+            raise
+
+    def decrypt_message(self, encrypted_message):
+        try:
+            # Decode from base64
+            combined_data = b64decode(encrypted_message)
+            
+            # Split IV and encrypted data
+            iv = combined_data[:16]
+            encrypted_data = combined_data[16:]
+            
+            # Decrypt
+            cipher = Cipher(algorithms.AES(self.session_key), modes.CBC(iv))
+            decryptor = cipher.decryptor()
+            padded_data = decryptor.update(encrypted_data) + decryptor.finalize()
+            
+            # Remove padding
+            unpadder = symmetric_padding.PKCS7(128).unpadder()
+            data = unpadder.update(padded_data) + unpadder.finalize()
+            return data.decode('utf-8')
+        except Exception as e:
+            print(f"Decryption error: {e}")
+            raise
+
     def send_message(self, message):
-        if not self.conn:
-            print("Not connected. Please authenticate first.")
+        if message.lower() == "disconnect":
+            self.update_message_display("Disconnecting from server...")
+            self.close_connection()
+            root.after(1000, root.destroy)  # Close the client window after 1 second
+            return "Disconnecting"
+        
+        if not self.conn or not self.session_key:
+            print("Not connected or no session key. Please authenticate first.")
             return "Not Authenticated"
         try:
-            self.conn.sendall(message.encode())
-            print(f"\nSent message to server: {message}")
+            encrypted_message = self.encrypt_message(message)
+            self.conn.sendall(encrypted_message.encode())
+            print(f"\nOriginal message: {message}")
+            print(f"Sent encrypted message: {encrypted_message}")
             self.update_message_display(f"You: {message}")
             return "Message sent"
         except Exception as e:
@@ -129,14 +203,25 @@ class WiMAXClient:
             return "Send Error"
 
     def receive_messages(self):
-        while self.conn:
+        while self.conn and self.session_key:
             try:
-                message = self.conn.recv(1024).decode()
-                if message:
-                    print(f"\nReceived from server: {message}")
-                    self.update_message_display(f"Server: {message}")
-                else:
+                data = self.conn.recv(1024)
+                if not data:
                     break
+                
+                encrypted_message = data.decode('utf-8')
+                print(f"\nReceived encrypted message: {encrypted_message}")
+                
+                decrypted_message = self.decrypt_message(encrypted_message)
+                print(f"Decrypted message: {decrypted_message}")
+                
+                if decrypted_message == "Server is shutting down":
+                    self.update_message_display("Server is shutting down. Closing connection...")
+                    self.close_connection()
+                    root.after(1000, root.destroy)  # Close the client window after 1 second
+                    break
+                
+                self.update_message_display(f"Server: {decrypted_message}")
             except Exception as e:
                 print(f"\nError receiving message: {e}")
                 break
@@ -144,8 +229,13 @@ class WiMAXClient:
 
     def close_connection(self):
         if self.conn:
+            try:
+                self.conn.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             self.conn.close()
             self.conn = None
+            self.session_key = None
             print("\nConnection closed.")
 
     def update_message_display(self, message):
