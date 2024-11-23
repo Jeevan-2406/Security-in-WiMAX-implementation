@@ -27,16 +27,32 @@ class WiMAXClient:
 
     def listen_for_servers(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_socket:
-            udp_socket.bind(('', self.broadcast_port))
+            # Set socket options for Windows
+            udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
+            try:
+                # For Windows, bind to empty string to receive broadcasts
+                udp_socket.bind(('0.0.0.0', self.broadcast_port))
+                print(f"Listening for server broadcasts on port {self.broadcast_port}...")
+            except OSError as e:
+                print(f"Error binding to broadcast port: {e}")
+                return
+            
             while True:
-                data, addr = udp_socket.recvfrom(1024)
-                message = data.decode()
-                if message.startswith("WiMAXServer:"):
-                    _, host, port = message.split(':')
-                    server_info = (host, int(port))
-                    if server_info not in self.servers:
-                        self.servers.append(server_info)
-                        self.update_server_listbox()
+                try:
+                    data, addr = udp_socket.recvfrom(1024)
+                    message = data.decode()
+                    if message.startswith("WiMAXServer:"):
+                        _, host, port = message.split(':')
+                        server_info = (host, int(port))
+                        if server_info not in self.servers:
+                            self.servers.append(server_info)
+                            print(f"Found server at {host}:{port}")
+                            self.update_server_listbox()
+                except Exception as e:
+                    print(f"Error receiving broadcast: {e}")
+                    continue
 
     def update_server_listbox(self):
         server_listbox.delete(0, tk.END)
